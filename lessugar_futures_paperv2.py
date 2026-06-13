@@ -26,16 +26,16 @@ CFG = {
     # Modal & Risk (shared satu akun untuk semua pair)
     "initial_balance":    1000.0,
     "leverage":           10,
-    "risk_per_trade":     0.01,       # 1% modal per trade
+    "risk_per_trade":     0.02,       # 2% modal per trade (agresif)
     "max_position_pct":   0.3,        # Max 30% modal per posisi (multi-pair)
     "max_open_positions": 4,          # Maksimal posisi terbuka bersamaan
-    "daily_loss_limit":   0.05,       # Stop jika loss harian > 5%
-    "max_consec_losses":  3,
-    "cooldown_minutes":   30,
+    "daily_loss_limit":   0.08,       # Stop jika loss harian > 8% (lebih longgar)
+    "max_consec_losses":  4,          # 4 loss berturut-turut baru cooldown
+    "cooldown_minutes":   15,         # Cooldown lebih pendek
 
     # SL / TP / Trailing
-    "sl_atr_mult":        1.5,
-    "tp_rr":              2.5,
+    "sl_atr_mult":        1.2,        # SL lebih ketat (entry lebih cepat)
+    "tp_rr":              2.0,        # RR 1:2 (TP lebih mudah tercapai)
     "trailing_enabled":   True,
     "trailing_atr_mult":  1.0,
 
@@ -45,8 +45,8 @@ CFG = {
     "ema_slow":    55,
     "ema_trend":   200,
     "rsi_period":  14,
-    "rsi_ob":      68,
-    "rsi_os":      32,
+    "rsi_ob":      65,                # Lebih sensitif (was 68)
+    "rsi_os":      35,                # Lebih sensitif (was 32)
     "macd_fast":   12,
     "macd_slow":   26,
     "macd_signal": 9,
@@ -54,15 +54,15 @@ CFG = {
     "atr_period":  14,
     "vol_ma_period": 20,
     "stoch_k":     14,
-    "stoch_ob":    80,
-    "stoch_os":    20,
+    "stoch_ob":    75,                # Lebih sensitif (was 80)
+    "stoch_os":    25,                # Lebih sensitif (was 20)
 
     # Scoring
-    "min_score_entry": 4,
+    "min_score_entry": 3,             # Lebih agresif (was 4)
 
     # System
     "log_dir":       "lessugar_logs",
-    "refresh_sec":   20,
+    "refresh_sec":   15,              # Scan lebih cepat (was 20)
 }
 
 # ── Definisi Pair ─────────────────────────────────────────────
@@ -744,7 +744,10 @@ class LessugarFuturesProV4:
     #  DASHBOARD
     # ══════════════════════════════════════════════════════════
     def print_dashboard(self, allowed: bool, allowed_msg: str):
-        os.system("cls" if os.name == "nt" else "clear")
+        try:
+            os.system("cls" if os.name == "nt" else "clear")
+        except Exception:
+            pass  # non-fatal: some terminals don't support cls
         c   = CFG
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         wr  = self.win_trades / max(self.total_trades, 1) * 100
@@ -891,11 +894,13 @@ class LessugarFuturesProV4:
                     self.fetch_fng()
                     self.fng_last_update = datetime.now()
 
-                allowed, allowed_msg = self.is_trading_allowed()
-
                 # ── Scan semua pair
+                allowed, allowed_msg = True, "OK"  # default; re-checked per pair
                 for symbol in PAIRS:
                     try:
+                        # Re-check trading permission each pair (positions may have changed)
+                        allowed, allowed_msg = self.is_trading_allowed()
+
                         df = self.fetch_ohlcv(symbol)
                         d  = self.compute_indicators(df)
                         sc = self.score_entry(d, self.fng["value"])
@@ -919,14 +924,14 @@ class LessugarFuturesProV4:
                                     exit_reason = "Stop Loss / Trailing"
                                 elif price >= pos.tp_price:
                                     exit_reason = "Take Profit"
-                                elif sc["short_score"] >= 7 and sc["long_score"] < 3:
+                                elif sc["short_score"] >= 5 and sc["long_score"] < 3:
                                     exit_reason = "Reversal Signal"
                             else:  # SHORT
                                 if price >= pos.sl_price:
                                     exit_reason = "Stop Loss / Trailing"
                                 elif price <= pos.tp_price:
                                     exit_reason = "Take Profit"
-                                elif sc["long_score"] >= 7 and sc["short_score"] < 3:
+                                elif sc["long_score"] >= 5 and sc["short_score"] < 3:
                                     exit_reason = "Reversal Signal"
 
                             if exit_reason:
@@ -958,7 +963,10 @@ class LessugarFuturesProV4:
                         print(Fore.RED + f"  ⚠ Error {symbol}: {e}")
 
                 # ── Print dashboard setelah semua pair di-scan
-                self.print_dashboard(allowed, allowed_msg)
+                try:
+                    self.print_dashboard(allowed, allowed_msg)
+                except Exception as e:
+                    print(Fore.RED + f"  ⚠ Dashboard render error: {e}")
                 sys.stdout.flush()
                 time.sleep(CFG["refresh_sec"])
 
