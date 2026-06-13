@@ -6,7 +6,7 @@
 ╚══════════════════════════════════════════════════════════════╝
 """
 
-import os, sys, time, json, re, requests
+import os, sys, time, json, re, math, requests
 import pandas as pd
 import pandas_ta as ta
 from datetime import datetime, date, timedelta
@@ -102,6 +102,16 @@ def score_color(s, threshold):
     if s >= threshold*0.7: return Fore.YELLOW
     return Fore.WHITE
 
+def safe_float(val, fallback: float = 0.0) -> float:
+    """Return fallback if value is NaN or None."""
+    if val is None:
+        return fallback
+    try:
+        f = float(val)
+        return fallback if math.isnan(f) or math.isinf(f) else f
+    except (TypeError, ValueError):
+        return fallback
+
 
 # ══════════════════════════════════════════════════════════════
 #  STATE POSISI PER PAIR
@@ -191,6 +201,10 @@ class LessugarFuturesProV4:
         self.trades_file = os.path.join(CFG["log_dir"], "trades_v4.json")
         self.trades: list = self._load_trades()
 
+        # State persistence (balance + open positions survive restart)
+        self.state_file = os.path.join(CFG["log_dir"], "state_v4.json")
+        self._load_state()
+
         # F&G (update lebih jarang)
         self.fng = {"value": 50, "label": "Neutral"}
         self.fng_last_update = datetime.min
@@ -207,25 +221,119 @@ class LessugarFuturesProV4:
         self.trades.append(entry)
         with open(self.trades_file, "w") as f:
             json.dump(self.trades, f, indent=2)
+        self._save_state()
+
+    # ── State Persistence ─────────────────────────────────────
+    def _save_state(self):
+        """Persist balance, stats, and open positions so restarts are safe."""
+        state = {
+            "balance":        self.balance,
+            "balance_today":  self.balance_today,
+            "peak_balance":   self.peak_balance,
+            "consec_losses":  self.consec_losses,
+            "daily_loss_usd": self.daily_loss_usd,
+            "daily_loss_date": self.daily_loss_date.isoformat(),
+            "total_trades":   self.total_trades,
+            "win_trades":     self.win_trades,
+            "total_pnl":      self.total_pnl,
+            "max_drawdown":   self.max_drawdown,
+            "pair_stats":     self.pair_stats,
+            "positions": {},
+        }
+        for sym, pos in self.positions.items():
+            if pos.in_position:
+                state["positions"][sym] = {
+                    "side":         pos.in_position,
+                    "entry_price":  pos.entry_price,
+                    "sl_price":     pos.sl_price,
+                    "tp_price":     pos.tp_price,
+                    "trail_price":  pos.trail_price,
+                    "position_usdt": pos.position_usdt,
+                    "open_time":    pos.open_time.strftime("%Y-%m-%d %H:%M:%S") if pos.open_time else None,
+                    "entry_score":  pos.entry_score,
+                }
+        try:
+            with open(self.state_file, "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception:
+            pass  # Non-fatal
+
+    def _load_state(self):
+        """Restore balance, stats, and open positions from disk."""
+        try:
+            with open(self.state_file) as f:
+                state = json.load(f)
+        except Exception:
+            return  # No saved state — start fresh
+
+        self.balance        = state.get("balance",        self.balance)
+        self.balance_today  = state.get("balance_today",  self.balance_today)
+        self.peak_balance   = state.get("peak_balance",   self.peak_balance)
+        self.consec_losses  = state.get("consec_losses",  self.consec_losses)
+        self.daily_loss_usd = state.get("daily_loss_usd", self.daily_loss_usd)
+        self.total_trades   = state.get("total_trades",   self.total_trades)
+        self.win_trades     = state.get("win_trades",     self.win_trades)
+        self.total_pnl      = state.get("total_pnl",      self.total_pnl)
+        self.max_drawdown   = state.get("max_drawdown",   self.max_drawdown)
+
+        saved_date = state.get("daily_loss_date", "")
+        if saved_date:
+            try:
+                self.daily_loss_date = date.fromisoformat(saved_date)
+            except Exception:
+                pass
+
+        saved_stats = state.get("pair_stats", {})
+        for sym, st in saved_stats.items():
+            if sym in self.pair_stats:
+                self.pair_stats[sym].update(st)
+
+        saved_positions = state.get("positions", {})
+        for sym, pdata in saved_positions.items():
+            if sym in self.positions:
+                pos = self.positions[sym]
+                pos.in_position   = pdata.get("side")
+                pos.entry_price   = pdata.get("entry_price", 0.0)
+                pos.sl_price      = pdata.get("sl_price", 0.0)
+                pos.tp_price      = pdata.get("tp_price", 0.0)
+                pos.trail_price   = pdata.get("trail_price", 0.0)
+                pos.position_usdt = pdata.get("position_usdt", 0.0)
+                pos.entry_score   = pdata.get("entry_score", 0.0)
+                ot = pdata.get("open_time")
+                if ot:
+                    try:
+                        pos.open_time = datetime.strptime(ot, "%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        pos.open_time = None
 
     # ── Fetch Data ───────────────────────────────────────────
-    def fetch_ohlcv(self, symbol: str) -> pd.DataFrame:
+    def fetch_ohlcv(self, symbol: str, max_retries: int = 3) -> pd.DataFrame:
         url = (
             f"https://fapi.binance.com/fapi/v1/klines"
             f"?symbol={symbol}&interval={CFG['timeframe']}"
             f"&limit={CFG['candle_limit']}"
         )
-        r   = requests.get(url, timeout=12)
-        raw = r.json()
-        if isinstance(raw, dict) and raw.get("code"):
-            raise ValueError(f"Binance error {symbol}: {raw.get('msg')}")
-        df = pd.DataFrame(raw, columns=[
-            "ts","open","high","low","close","volume",
-            "close_time","qav","trades","tbv","tqv","ignore"
-        ])
-        for col in ["open","high","low","close","volume"]:
-            df[col] = df[col].astype(float)
-        return df
+        last_err = None
+        for attempt in range(max_retries):
+            try:
+                r   = requests.get(url, timeout=12)
+                raw = r.json()
+                if isinstance(raw, dict) and raw.get("code"):
+                    raise ValueError(f"Binance error {symbol}: {raw.get('msg')}")
+                df = pd.DataFrame(raw, columns=[
+                    "ts","open","high","low","close","volume",
+                    "close_time","qav","trades","tbv","tqv","ignore"
+                ])
+                for col in ["open","high","low","close","volume"]:
+                    df[col] = df[col].astype(float)
+                if len(df) < 60:
+                    raise ValueError(f"Insufficient candles for {symbol}: {len(df)} (need 60+)")
+                return df
+            except (requests.exceptions.RequestException, ValueError) as e:
+                last_err = e
+                wait = 2 ** attempt  # 1s, 2s, 4s backoff
+                time.sleep(wait)
+        raise last_err  # type: ignore
 
     def fetch_fng(self):
         try:
@@ -296,60 +404,83 @@ class LessugarFuturesProV4:
         last = df.iloc[-1]
         prev = df.iloc[-2]
 
+        # Safe indicator reads (NaN → fallback 0.0)
+        price     = safe_float(last["close"])
+        opn       = safe_float(last["open"])
+        high      = safe_float(last["high"])
+        low       = safe_float(last["low"])
+        vol       = safe_float(last["volume"])
+        vol_ma    = safe_float(last["VOL_MA"])
+        rsi       = safe_float(last["RSI"], 50.0)
+        ema9      = safe_float(last["EMA9"],  price)
+        ema21     = safe_float(last["EMA21"], price)
+        ema55     = safe_float(last["EMA55"], price)
+        ema200    = safe_float(last["EMA200"], price)
+        macd      = safe_float(last["MACD"])
+        macd_sig  = safe_float(last["MACD_SIG"])
+        macd_hist = safe_float(last["MACD_HIST"])
+        bbu       = safe_float(last["BBU"], price * 1.05)
+        bbm       = safe_float(last["BBM"], price)
+        bbl       = safe_float(last["BBL"], price * 0.95)
+        atr       = safe_float(last["ATR"], 0.0001)
+        stoch_k   = safe_float(last["STOCH_K"], 50.0)
+        stoch_d   = safe_float(last["STOCH_D"], 50.0)
+
+        prev_macd     = safe_float(prev["MACD"])
+        prev_macd_sig = safe_float(prev["MACD_SIG"])
+        prev_close    = safe_float(prev["close"])
+        prev_open     = safe_float(prev["open"])
+
         # Pola candle
-        body  = abs(float(last["close"]) - float(last["open"]))
-        wick  = float(last["high"]) - float(last["low"])
+        body  = abs(opn - price) if price != opn else 0.0001
+        wick  = max(high - low, 0.0001)
         doji  = body < wick * 0.1
 
-        hammer = (float(last["close"]) > float(last["open"])) and \
-                 (float(last["open"]) - float(last["low"])) > body * 2
+        hammer = (price > opn) and (opn - low) > body * 2
 
-        shooting = (float(last["close"]) < float(last["open"])) and \
-                   (float(last["high"]) - float(last["open"])) > body * 2
+        shooting = (price < opn) and (high - opn) > body * 2
 
-        bull_engulf = (float(prev["close"]) < float(prev["open"])) and \
-                      (float(last["close"]) > float(last["open"])) and \
-                      (float(last["close"]) > float(prev["open"])) and \
-                      (float(last["open"]) < float(prev["close"]))
+        bull_engulf = (prev_close < prev_open) and \
+                      (price > opn) and \
+                      (price > prev_open) and \
+                      (opn < prev_close)
 
-        bear_engulf = (float(prev["close"]) > float(prev["open"])) and \
-                      (float(last["close"]) < float(last["open"])) and \
-                      (float(last["close"]) < float(prev["open"])) and \
-                      (float(last["open"]) > float(prev["close"]))
+        bear_engulf = (prev_close > prev_open) and \
+                      (price < opn) and \
+                      (price < prev_open) and \
+                      (opn > prev_close)
 
-        macd_cross_up = float(prev["MACD"]) < float(prev["MACD_SIG"]) and \
-                        float(last["MACD"]) >= float(last["MACD_SIG"])
-        macd_cross_dn = float(prev["MACD"]) > float(prev["MACD_SIG"]) and \
-                        float(last["MACD"]) <= float(last["MACD_SIG"])
+        macd_cross_up = prev_macd < prev_macd_sig and macd >= macd_sig
+        macd_cross_dn = prev_macd > prev_macd_sig and macd <= macd_sig
 
         return {
-            "price":        float(last["close"]),
-            "open":         float(last["open"]),
-            "high":         float(last["high"]),
-            "low":          float(last["low"]),
-            "volume":       float(last["volume"]),
-            "vol_ma":       float(last["VOL_MA"]),
-            "rsi":          float(last["RSI"]),
-            "ema9":         float(last["EMA9"]),
-            "ema21":        float(last["EMA21"]),
-            "ema55":        float(last["EMA55"]),
-            "ema200":       float(last["EMA200"]),
-            "macd":         float(last["MACD"]),
-            "macd_sig":     float(last["MACD_SIG"]),
-            "macd_hist":    float(last["MACD_HIST"]),
+            "price":        price,
+            "open":         opn,
+            "high":         high,
+            "low":          low,
+            "volume":       vol,
+            "vol_ma":       vol_ma,
+            "rsi":          rsi,
+            "ema9":         ema9,
+            "ema21":        ema21,
+            "ema55":        ema55,
+            "ema200":       ema200,
+            "macd":         macd,
+            "macd_sig":     macd_sig,
+            "macd_hist":    macd_hist,
             "macd_cross_up": macd_cross_up,
             "macd_cross_dn": macd_cross_dn,
-            "bbu":          float(last["BBU"]),
-            "bbm":          float(last["BBM"]),
-            "bbl":          float(last["BBL"]),
-            "atr":          float(last["ATR"]),
-            "stoch_k":      float(last["STOCH_K"]),
-            "stoch_d":      float(last["STOCH_D"]),
+            "bbu":          bbu,
+            "bbm":          bbm,
+            "bbl":          bbl,
+            "atr":          atr,
+            "stoch_k":      stoch_k,
+            "stoch_d":      stoch_d,
             "support":      float(support),
             "resistance":   float(resistance),
             "fibo":         fibo,
-            "vol_spike":    float(last["volume"]) > float(last["VOL_MA"]) * 1.5,
-            "candle_bull":  float(last["close"]) > float(last["open"]),
+            "vol_spike":    vol > vol_ma * 1.5 if vol_ma > 0 else False,
+            "candle_bull":  price > opn,
             "doji":         doji,
             "hammer":       hammer,
             "shooting_star": shooting,
@@ -502,12 +633,25 @@ class LessugarFuturesProV4:
                 if pos.trail_price < pos.sl_price:
                     pos.sl_price = round(pos.trail_price, 2)
 
+    # ── Total Exposure Check ──────────────────────────────────
+    def total_open_exposure(self) -> float:
+        """Sum of position_usdt for all open positions."""
+        return sum(p.position_usdt for p in self.positions.values() if p.in_position)
+
     # ── Entry ────────────────────────────────────────────────
     def enter_position(self, symbol: str, side: str, price: float,
                        atr: float, reasons: list, score: float):
+        # ATR sanity check — skip if volatility is near-zero (stale data)
+        if atr <= 0 or price <= 0:
+            return
+
         pos     = self.positions[symbol]
         sl_dist = atr * CFG["sl_atr_mult"]
         tp_dist = sl_dist * CFG["tp_rr"]
+
+        # Protect against zero SL distance
+        if sl_dist / price < 0.0005:  # SL < 0.05% = too tight, skip
+            return
 
         if side == "LONG":
             sl = price - sl_dist
@@ -516,16 +660,26 @@ class LessugarFuturesProV4:
             sl = price + sl_dist
             tp = price - tp_dist
 
-        # Position sizing
-        risk_usdt = self.balance * CFG["risk_per_trade"]
-        sl_pct    = sl_dist / price
-        pos_usdt  = min(risk_usdt / sl_pct, self.balance * CFG["max_position_pct"])
+        # Position sizing with total exposure cap
+        risk_usdt   = self.balance * CFG["risk_per_trade"]
+        sl_pct      = sl_dist / price
+        pos_usdt    = risk_usdt / sl_pct
+        max_total   = self.balance * CFG["max_position_pct"] * CFG["max_open_positions"]
+        remaining   = max(max_total - self.total_open_exposure(), 0)
+        pos_usdt    = min(pos_usdt, self.balance * CFG["max_position_pct"], remaining)
+
+        if pos_usdt < 5.0:  # Minimum viable position
+            return
 
         pos.in_position   = side
         pos.entry_price   = price
         pos.sl_price      = round(sl, 4)
         pos.tp_price      = round(tp, 4)
-        pos.trail_price   = round(sl, 4)
+        # Fix trailing init: start beyond SL so first update always works
+        if side == "LONG":
+            pos.trail_price = round(sl - atr * 0.1, 4)   # slightly below SL
+        else:
+            pos.trail_price = round(sl + atr * 0.1, 4)   # slightly above SL
         pos.position_usdt = round(pos_usdt, 2)
         pos.open_time     = datetime.now()
         pos.entry_score   = score

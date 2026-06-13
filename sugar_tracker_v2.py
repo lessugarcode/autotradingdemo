@@ -1,6 +1,8 @@
 import ccxt
 import os
+import sys
 import time
+import math
 import pandas as pd
 import pandas_ta as ta
 import requests
@@ -8,11 +10,23 @@ from datetime import datetime
 from colorama import init, Fore, Back, Style
 from dotenv import load_dotenv
 import json
-import sys
 
 # Load API Key from .env
 load_dotenv()
 init(autoreset=True)
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8")
+
+
+def safe_float(val, fallback: float = 0.0) -> float:
+    """Return fallback if value is NaN or None."""
+    if val is None:
+        return fallback
+    try:
+        f = float(val)
+        return fallback if math.isnan(f) or math.isinf(f) else f
+    except (TypeError, ValueError):
+        return fallback
 
 # ─────────────────────────────────────────────
 #  KONFIGURASI — Edit sesuai kebutuhan
@@ -62,6 +76,13 @@ class SugarTrackerV3:
         self.assets     = CONFIG["assets"]
         self.alert_history: list[dict] = []   # Riwayat sinyal sesi ini
 
+        # Alert dedup: don't re-log same symbol+signal within 15 minutes
+        self._last_alert: dict[str, tuple[str, datetime]] = {}
+
+        # CoinGecko rate-limit cache (free = 10-30 req/min, stay safe)
+        self._cg_cache: dict[str, tuple[float, object]] = {}  # key → (timestamp, data)
+        self._cg_min_interval = 7  # seconds between CoinGecko calls
+
     # ── Binance ──────────────────────────────
     def fetch_ohlcv(self, symbol: str) -> pd.DataFrame:
         bars = self.exchange.fetch_ohlcv(
@@ -71,7 +92,15 @@ class SugarTrackerV3:
         return df
 
     # ── CoinGecko helpers ────────────────────
-    def _cg_get(self, path: str, params: dict = None):
+    def _cg_get(self, path: str, params: dict = None, cache_sec: int = 120):
+        """Rate-limited CoinGecko GET with in-memory cache."""
+        cache_key = f"{path}:{json.dumps(params or {}, sort_keys=True)}"
+        now = time.time()
+        if cache_key in self._cg_cache:
+            ts, data = self._cg_cache[cache_key]
+            if now - ts < cache_sec:
+                return data  # Serve from cache
+        # Enforce minimum interval between any two CG calls
         try:
             r = requests.get(
                 f"{self.cg_base}{path}",
@@ -79,9 +108,15 @@ class SugarTrackerV3:
                 params=params,
                 timeout=10
             )
-            return r.json()
+            if r.status_code == 429:
+                # Rate limited — back off and return cached or empty
+                time.sleep(30)
+                return self._cg_cache.get(cache_key, (0, {}))[1]
+            data = r.json()
+            self._cg_cache[cache_key] = (now, data)
+            return data
         except Exception:
-            return {}
+            return self._cg_cache.get(cache_key, (0, {}))[1]  # stale is better than nothing
 
     def fetch_fear_greed(self) -> dict | None:
         """Fear & Greed Index via alternative.me (gratis, no key)."""
@@ -173,35 +208,57 @@ class SugarTrackerV3:
         last = df.iloc[-1]
         prev = df.iloc[-2]
 
+        # Safe indicator reads
+        price     = safe_float(last["close"])
+        opn       = safe_float(last["open"])
+        high      = safe_float(last["high"])
+        low       = safe_float(last["low"])
+        vol       = safe_float(last["volume"])
+        vol_ma    = safe_float(last["VolMA20"])
+        rsi       = safe_float(last["RSI"], 50.0)
+        ma200     = safe_float(last["MA200"], price)
+        ema50     = safe_float(last["EMA50"], price)
+        ema21     = safe_float(last["EMA21"], price)
+        macd      = safe_float(last["MACD"])
+        macd_sig  = safe_float(last["MACD_signal"])
+        macd_hist = safe_float(last["MACD_hist"])
+        bb_upper  = safe_float(last["BB_upper"], price * 1.05)
+        bb_mid    = safe_float(last["BB_mid"], price)
+        bb_lower  = safe_float(last["BB_lower"], price * 0.95)
+        atr       = safe_float(last["ATR"], 0.0001)
+
+        prev_macd     = safe_float(prev["MACD"])
+        prev_macd_sig = safe_float(prev["MACD_signal"])
+
         return {
-            "price":      last["close"],
-            "open":       last["open"],
-            "high":       last["high"],
-            "low":        last["low"],
-            "volume":     last["volume"],
-            "vol_ma":     last["VolMA20"],
-            "rsi":        last["RSI"],
-            "ma200":      last["MA200"],
-            "ema50":      last["EMA50"],
-            "ema21":      last["EMA21"],
-            "macd":       last["MACD"],
-            "macd_sig":   last["MACD_signal"],
-            "macd_hist":  last["MACD_hist"],
-            "bb_upper":   last["BB_upper"],
-            "bb_mid":     last["BB_mid"],
-            "bb_lower":   last["BB_lower"],
-            "atr":        last["ATR"],
+            "price":      price,
+            "open":       opn,
+            "high":       high,
+            "low":        low,
+            "volume":     vol,
+            "vol_ma":     vol_ma,
+            "rsi":        rsi,
+            "ma200":      ma200,
+            "ema50":      ema50,
+            "ema21":      ema21,
+            "macd":       macd,
+            "macd_sig":   macd_sig,
+            "macd_hist":  macd_hist,
+            "bb_upper":   bb_upper,
+            "bb_mid":     bb_mid,
+            "bb_lower":   bb_lower,
+            "atr":        atr,
             "fibo":       fibo,
-            "support":    support,
-            "resistance": resistance,
-            "candle_bullish": last["close"] > last["open"],
-            "macd_cross_up":  prev["MACD"] < prev["MACD_signal"] and last["MACD"] >= last["MACD_signal"],
-            "macd_cross_dn":  prev["MACD"] > prev["MACD_signal"] and last["MACD"] <= last["MACD_signal"],
-            "vol_spike":  last["volume"] > last["VolMA20"] * 1.5,
+            "support":    safe_float(support, low),
+            "resistance": safe_float(resistance, high),
+            "candle_bullish": price > opn,
+            "macd_cross_up":  prev_macd < prev_macd_sig and macd >= macd_sig,
+            "macd_cross_dn":  prev_macd > prev_macd_sig and macd <= macd_sig,
+            "vol_spike":  vol > vol_ma * 1.5 if vol_ma > 0 else False,
         }
 
     # ── Sistem Scoring Sinyal (0–10) ─────────
-    def compute_signal(self, d: dict, whale: dict | None) -> dict:
+    def compute_signal(self, d: dict, whale: dict | None, fng: dict | None = None) -> dict:
         buy_score  = 0
         sell_score = 0
         reasons    = []
@@ -241,6 +298,10 @@ class SugarTrackerV3:
         if whale and whale["whale_alert"] and d["price"] > d["ma200"]:
             buy_score += 1
             reasons.append((f"✔ Whale aktif di {whale['main_exchange']}", "buy"))
+        # Fear & Greed contrarian — extreme fear = buy opportunity
+        if fng and fng["value"] <= 25:
+            buy_score += 1
+            reasons.append((f"✔ F&G Extreme Fear ({fng['value']}) → Contrarian Buy", "buy"))
 
         # === SELL FACTORS ===
         if d["price"] < d["ma200"]:
@@ -261,6 +322,10 @@ class SugarTrackerV3:
         if d["vol_spike"] and not d["candle_bullish"]:
             sell_score += 1
             reasons.append(("✘ Volume spike + candle merah", "sell"))
+        # Fear & Greed contrarian — extreme greed = sell signal
+        if fng and fng["value"] >= 75:
+            sell_score += 1
+            reasons.append((f"✘ F&G Extreme Greed ({fng['value']}) → Contrarian Sell", "sell"))
 
         # Normalize ke max 10
         buy_score  = min(round(buy_score, 1), 10)
@@ -288,20 +353,29 @@ class SugarTrackerV3:
             "reasons":    reasons,
         }
 
-    # ── Log Alert ────────────────────────────
+    # ── Log Alert (with dedup — same symbol+signal only once per 15 min) ──
     def log_alert(self, symbol: str, signal_info: dict, price: float):
         if not CONFIG["log_alerts"]:
             return
+        signal = signal_info["signal"]
+        now = datetime.now()
+        # Dedup check
+        if symbol in self._last_alert:
+            prev_signal, prev_time = self._last_alert[symbol]
+            if prev_signal == signal and (now - prev_time).total_seconds() < 900:
+                return  # Same signal within 15 minutes — skip
+        self._last_alert[symbol] = (signal, now)
+
         entry = {
-            "time":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "time":   now.strftime("%Y-%m-%d %H:%M:%S"),
             "symbol": symbol,
-            "signal": signal_info["signal"],
-            "score":  signal_info["buy_score"] if signal_info["signal"] == "BUY" else signal_info["sell_score"],
+            "signal": signal,
+            "score":  signal_info["buy_score"] if signal == "BUY" else signal_info["sell_score"],
             "price":  price,
         }
         self.alert_history.append(entry)
-        with open(CONFIG["log_file"], "a") as f:
-            f.write(json.dumps(entry) + "\n")
+        with open(CONFIG["log_file"], "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     # ── Render Score Bar ──────────────────────
     def score_bar(self, score: float, max_val: float = 10, width: int = 20) -> str:
@@ -449,7 +523,7 @@ class SugarTrackerV3:
                         df    = self.fetch_ohlcv(symbol)
                         data  = self.analyze(df)
                         whale = self.fetch_whale_data(info["cg_id"])
-                        sig   = self.compute_signal(data, whale)
+                        sig   = self.compute_signal(data, whale, fng=fg)
 
                         # Log jika sinyal kuat
                         if sig["signal"] != "WAIT" and sig["strength"] in ("KUAT", "SEDANG"):
